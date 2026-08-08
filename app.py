@@ -3,8 +3,8 @@ import warnings
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (registers 3D projection)
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler, PolynomialFeatures
 from sklearn.linear_model import LinearRegression, Ridge
@@ -22,7 +22,124 @@ from scipy.optimize import differential_evolution
 
 warnings.filterwarnings("ignore")  # small-sample sklearn convergence/feature-name warnings are just noise here
 
-st.set_page_config(page_title="Formulation Prediction App", page_icon="🧪", layout="wide")
+st.set_page_config(page_title="Formulation Lab | DoE Dashboard", page_icon="🧬", layout="wide")
+
+# ----------------------------------------------------------------------
+# Design system
+# ----------------------------------------------------------------------
+# A "lab instrument" identity for a DoE dashboard: cool near-white canvas
+# (not the usual warm-cream AI-tool default), a single teal accent, and
+# monospace numerals so data reads like a measurement readout rather than
+# marketing copy. Tokens:
+#   canvas #F5F7F8   panel #FFFFFF   ink #101820   slate #55606B
+#   teal (primary)   #0E6E62        amber (highlight) #C97A2B
+# Display face: Space Grotesk · Body: Inter · Data: IBM Plex Mono
+CUSTOM_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+
+:root {
+  --canvas: #F5F7F8;
+  --panel: #FFFFFF;
+  --ink: #101820;
+  --slate: #55606B;
+  --teal: #0E6E62;
+  --teal-dark: #0B5850;
+  --amber: #C97A2B;
+  --border: #E2E6EA;
+}
+
+.stApp { background-color: var(--canvas); }
+
+h1, h2, h3, h4, .stApp [data-testid="stMarkdownContainer"] h1,
+.stApp [data-testid="stMarkdownContainer"] h2, .stApp [data-testid="stMarkdownContainer"] h3 {
+  font-family: 'Space Grotesk', sans-serif !important;
+  color: var(--ink) !important;
+  letter-spacing: -0.01em;
+}
+html, body, [class*="css"], .stApp, p, label, .stMarkdown {
+  font-family: 'Inter', sans-serif;
+}
+.stApp [data-testid="stMetricValue"], code, .stDataFrame, [data-testid="stDataFrame"] * {
+  font-family: 'IBM Plex Mono', monospace !important;
+}
+
+/* Hero header */
+.app-eyebrow {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.72rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--teal);
+  margin-bottom: 0.3rem;
+  font-weight: 600;
+}
+.app-hero-title {
+  font-family: 'Space Grotesk', sans-serif;
+  font-weight: 700;
+  font-size: 2.1rem;
+  color: var(--ink);
+  margin: 0 0 0.3rem 0;
+  line-height: 1.15;
+}
+.app-hero-sub { color: var(--slate); font-size: 0.96rem; margin-bottom: 0.7rem; max-width: 70ch; }
+.app-hr { border: none; border-top: 1px solid var(--border); margin: 0 0 1.3rem 0; }
+
+/* Spec strip: a mono "readout" line of key facts under a header */
+.spec-strip {
+  display: flex; gap: 1.6rem; flex-wrap: wrap;
+  font-family: 'IBM Plex Mono', monospace; font-size: 0.76rem; color: var(--slate);
+  border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
+  padding: 0.55rem 0.1rem; margin: -0.6rem 0 1.5rem 0;
+}
+.spec-strip b { color: var(--ink); font-weight: 600; }
+
+/* Sidebar as a dark console panel */
+[data-testid="stSidebar"] { background-color: var(--ink); }
+[data-testid="stSidebar"] * { color: #E8EDF0 !important; }
+[data-testid="stSidebar"] .app-eyebrow { color: #57C7B8 !important; }
+[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,0.14); }
+[data-testid="stSidebar"] [data-testid="stMetric"] { background: rgba(255,255,255,0.06); border-color: rgba(255,255,255,0.14); }
+
+/* Metric / KPI cards */
+[data-testid="stMetric"] {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.85rem 1rem;
+}
+
+/* Buttons */
+.stButton>button, .stDownloadButton>button {
+  background-color: var(--teal); color: #fff !important; border: none !important;
+  border-radius: 8px !important; font-weight: 600; padding: 0.5rem 1.1rem;
+}
+.stButton>button:hover, .stDownloadButton>button:hover { background-color: var(--teal-dark); }
+
+/* Dataframes / tables */
+[data-testid="stDataFrame"] { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+
+/* Tabs & selects: tidy borders */
+[data-baseweb="select"] > div { border-radius: 8px !important; border-color: var(--border) !important; }
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+TEAL_SCALE = [[0.0, "#F5F7F8"], [0.35, "#9FD6CB"], [0.7, "#33978A"], [1.0, "#0E6E62"]]
+
+
+def render_header(eyebrow, title, subtitle=None, facts=None):
+    """Consistent hero header used at the top of every page."""
+    st.markdown(f'<div class="app-eyebrow">{eyebrow}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="app-hero-title">{title}</div>', unsafe_allow_html=True)
+    if subtitle:
+        st.markdown(f'<div class="app-hero-sub">{subtitle}</div>', unsafe_allow_html=True)
+    if facts:
+        strip = "".join(f"<span>{f}</span>" for f in facts)
+        st.markdown(f'<div class="spec-strip">{strip}</div>', unsafe_allow_html=True)
+    else:
+        st.markdown('<hr class="app-hr"/>', unsafe_allow_html=True)
+
 
 # Ensure the folder for saved models exists (needed before joblib.dump)
 os.makedirs("models", exist_ok=True)
@@ -137,29 +254,43 @@ with st.spinner("Training and tuning models with leave-one-out cross-validation.
 # ----------------------------------------------------------------------
 # Multi-page dashboard
 # ----------------------------------------------------------------------
-st.sidebar.title("Navigation")
+st.sidebar.markdown('<div class="app-eyebrow">Lipid Nanoparticle DoE</div>', unsafe_allow_html=True)
+st.sidebar.markdown(
+    '<div style="font-family:\'Space Grotesk\',sans-serif;font-weight:700;'
+    'font-size:1.35rem;margin-bottom:1rem;">🧬 Formulation Lab</div>',
+    unsafe_allow_html=True,
+)
 page = st.sidebar.radio(
     "Go to",
     ["Dataset", "Prediction", "Reverse Prediction", "Model Comparison", "ANOVA Analysis",
      "Response Surfaces", "Optimization", "Outlier Analysis"],
 )
 st.sidebar.markdown("---")
-st.sidebar.caption(
-    f"🏆 Best model (LOOCV R²): **{best_model_name}** "
-    f"({metrics[best_model_name]['R² (LOOCV)']:.3f})"
+st.sidebar.markdown(
+    '<div style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.14);'
+    'border-radius:10px;padding:0.8rem 0.9rem;">'
+    '<div class="app-eyebrow" style="margin-bottom:0.4rem;">Best model (LOOCV R²)</div>'
+    f'<div style="font-family:\'Space Grotesk\',sans-serif;font-weight:600;font-size:1.05rem;'
+    f'line-height:1.25;">{best_model_name}</div>'
+    f'<div style="font-family:\'IBM Plex Mono\',monospace;font-size:0.82rem;color:#57C7B8;'
+    f'margin-top:0.3rem;">↑ R² = {metrics[best_model_name]["R² (LOOCV)"]:.3f}</div>'
+    '</div>',
+    unsafe_allow_html=True,
 )
 
 # ---------------- Dataset ----------------
 if page == "Dataset":
-    st.title("Original Dataset")
-    st.markdown(
-        "The raw experimental design matrix loaded from "
-        f"`{DATA_PATH}` — {data.shape[0]} runs × {data.shape[1]} columns."
+    render_header(
+        "Raw Data",
+        "Original Dataset",
+        "The experimental design matrix used to train and validate every model in this app.",
+        facts=[f"<b>{data.shape[0]}</b> runs", f"<b>{data.shape[1]}</b> columns",
+               "<b>2</b> factors", "<b>4</b> responses"],
     )
-    st.dataframe(data, use_container_width=True, hide_index=True)
+    st.dataframe(data, width='stretch', hide_index=True)
 
-    st.markdown("### Summary Statistics")
-    st.dataframe(data.describe().T, use_container_width=True)
+    st.markdown("#### Summary Statistics")
+    st.dataframe(data.describe().T, width='stretch')
 
     st.download_button(
         "Download dataset as CSV",
@@ -170,7 +301,11 @@ if page == "Dataset":
 
 # ---------------- Prediction UI ----------------
 elif page == "Prediction":
-    st.title("Formulation Prediction App")
+    render_header(
+        "Forward Model",
+        "Formulation Predictor",
+        "Enter a candidate formulation and compare predictions across all six tuned models.",
+    )
     st.sidebar.header("Input Parameters")
     stearic = st.sidebar.number_input("Stearic acid", min_value=60, max_value=400, step=10, value=240)
     tween = st.sidebar.number_input("Tween 80", min_value=60, max_value=200, step=10, value=120)
@@ -182,7 +317,7 @@ elif page == "Prediction":
             rows.append(model.predict([[stearic, tween]])[0])
             index.append(f"⭐ {name}" if name == best_model_name else name)
 
-        st.write("### Predictions from all models")
+        st.write("#### Predictions from all models")
         st.table(pd.DataFrame(rows, index=index, columns=output_cols))
         st.caption(
             f"⭐ = model with the best leave-one-out cross-validated R² "
@@ -192,12 +327,11 @@ elif page == "Prediction":
 
 # ---------------- Reverse Prediction (Inverse Design) ----------------
 elif page == "Reverse Prediction":
-    st.title("Reverse Prediction (Inverse Design)")
-    st.markdown(
-        "Specify the **desired outcome** — target Entrapment efficiency, "
-        "Drug content, Drug release, and Particle size — and this page "
-        "searches the design space for the **Stearic acid / Tween 80** "
-        "combination whose predicted outputs come closest to those targets."
+    render_header(
+        "Inverse Design",
+        "Reverse Prediction",
+        "Specify the desired outcome and search the design space for the "
+        "Stearic acid / Tween 80 combination that best achieves it.",
     )
     st.caption(
         "This is an inverse (many-to-few) problem: 4 targets, 2 tunable "
@@ -297,10 +431,13 @@ elif page == "Reverse Prediction":
 
 # ---------------- Model comparison ----------------
 elif page == "Model Comparison":
-    st.title("Model Comparison")
+    render_header(
+        "Validation",
+        "Model Comparison",
+        "Leave-one-out cross-validated performance across all six tuned models.",
+    )
     st.markdown(
-        "All metrics below are computed with **leave-one-out cross-validation "
-        "(LOOCV)**: each of the 10 experimental runs is held out and predicted "
+        "Each of the 10 experimental runs is held out and predicted "
         "exactly once by a model trained on the other 9. This is far more "
         "reliable than a single random train/test split on a 10-row dataset, "
         "where the test set would only be 1–2 points."
@@ -308,20 +445,28 @@ elif page == "Model Comparison":
 
     metrics_df = pd.DataFrame(metrics).T
     metrics_df = metrics_df.sort_values("R² (LOOCV)", ascending=False)
+    metrics_df = metrics_df.reset_index().rename(columns={"index": "Model"})
 
     def highlight_best(row):
-        return ["background-color: #d1fae5" if row.name == best_model_name else "" for _ in row]
+        return ["background-color: #D6EFE9" if row["Model"] == best_model_name else "" for _ in row]
 
-    st.dataframe(metrics_df.style.apply(highlight_best, axis=1).format("{:.4f}"), use_container_width=True)
+    st.dataframe(
+        metrics_df.style.apply(highlight_best, axis=1).format(
+            {c: "{:.4f}" for c in metrics_df.columns if c != "Model"}
+        ),
+        width='stretch',
+        hide_index=True,
+        column_config={"Model": st.column_config.TextColumn("Model", width="medium")},
+    )
     st.success(
-        f"🏆 Best model: **{best_model_name}** "
+        f"Best model: **{best_model_name}** "
         f"(R² = {metrics[best_model_name]['R² (LOOCV)']:.3f}). "
         "This is the model used as the default in Reverse Prediction and "
         "the ⭐-marked row in Prediction.",
         icon="🏆",
     )
 
-    st.markdown("### Tuned Hyperparameters")
+    st.markdown("#### Tuned Hyperparameters")
     st.caption(
         "Hyperparameters were selected via GridSearchCV using the same "
         "leave-one-out cross-validation splits, favoring settings that "
@@ -343,7 +488,7 @@ elif page == "Model Comparison":
 
 # ---------------- ANOVA ----------------
 elif page == "ANOVA Analysis":
-    st.title("ANOVA Analysis")
+    render_header("Statistics", "ANOVA Analysis", "OLS regression summary for any selected response.")
     response_name = st.selectbox("Response", y.columns.tolist())
     X_const = sm.add_constant(X)
     model = sm.OLS(y[response_name], X_const).fit()
@@ -351,55 +496,90 @@ elif page == "ANOVA Analysis":
 
 # ---------------- Response surfaces ----------------
 elif page == "Response Surfaces":
-    st.title("Response Surface & Contour Plots")
+    render_header(
+        "Response Surface Methodology",
+        "3D Surface & Contour Plots",
+        "Model-predicted response across the full Stearic acid × Tween 80 design space.",
+    )
 
-    surface_model_name = st.selectbox(
+    c1, c2 = st.columns(2)
+    surface_model_name = c1.selectbox(
         "Model",
         list(models.keys()),
         index=list(models.keys()).index(best_model_name),
         help="Defaults to the model with the best leave-one-out cross-validated R².",
     )
-
-    def plot_surface(feature1, feature2, target_index, title):
-        f1_range = np.linspace(X[feature1].min(), X[feature1].max(), 30)
-        f2_range = np.linspace(X[feature2].min(), X[feature2].max(), 30)
-        f1_grid, f2_grid = np.meshgrid(f1_range, f2_range)
-        inputs = np.array([[f1, f2] for f1, f2 in zip(np.ravel(f1_grid), np.ravel(f2_grid))])
-        preds = models[surface_model_name].predict(inputs)[:, target_index].reshape(f1_grid.shape)
-
-        fig = plt.figure()
-        ax = fig.add_subplot(111, projection="3d")
-        ax.plot_surface(f1_grid, f2_grid, preds, cmap="viridis")
-        ax.set_xlabel(feature1)
-        ax.set_ylabel(feature2)
-        ax.set_zlabel("Response")
-        ax.set_title(title)
-        st.pyplot(fig)
-
-        fig2, ax2 = plt.subplots()
-        contour = ax2.contourf(f1_grid, f2_grid, preds, cmap="viridis")
-        fig2.colorbar(contour)
-        ax2.set_xlabel(feature1)
-        ax2.set_ylabel(feature2)
-        ax2.set_title(f"Contour Plot - {title}")
-        st.pyplot(fig2)
-
     target_options = {
         "Entrapment efficiency": 0,
         "Drug content": 1,
         "Drug release": 2,
         "Particle size": 3,
     }
-    target_name = st.selectbox("Response to plot", list(target_options.keys()))
-    plot_surface("Stearic acid", "Tween 80", target_options[target_name], target_name)
+    target_name = c2.selectbox("Response to plot", list(target_options.keys()))
+    target_index = target_options[target_name]
+
+    f1_range = np.linspace(X["Stearic acid"].min(), X["Stearic acid"].max(), 30)
+    f2_range = np.linspace(X["Tween 80"].min(), X["Tween 80"].max(), 30)
+    f1_grid, f2_grid = np.meshgrid(f1_range, f2_range)
+    inputs = np.array([[a, b] for a, b in zip(np.ravel(f1_grid), np.ravel(f2_grid))])
+    preds = models[surface_model_name].predict(inputs)[:, target_index].reshape(f1_grid.shape)
+
+    tab_surface, tab_contour = st.tabs(["3D Surface", "2D Contour"])
+    with tab_surface:
+        fig3d = go.Figure(data=[go.Surface(
+            x=f1_range, y=f2_range, z=preds, colorscale=TEAL_SCALE,
+            colorbar=dict(title=target_name),
+        )])
+        fig3d.add_trace(go.Scatter3d(
+            x=data["Stearic acid"], y=data["Tween 80"], z=data[target_name],
+            mode="markers", marker=dict(size=5, color="#C97A2B"), name="Experimental runs",
+        ))
+        fig3d.update_layout(
+            scene=dict(xaxis_title="Stearic acid (mg)", yaxis_title="Tween 80 (mg)", zaxis_title=target_name),
+            height=560, margin=dict(l=0, r=0, t=20, b=0),
+            paper_bgcolor="rgba(0,0,0,0)", font=dict(family="Inter, sans-serif", color="#101820"),
+        )
+        st.plotly_chart(fig3d, width='stretch')
+
+    with tab_contour:
+        figc = go.Figure(data=go.Contour(
+            x=f1_range, y=f2_range, z=preds, colorscale=TEAL_SCALE,
+            contours=dict(showlabels=True, labelfont=dict(size=10, color="white")),
+            colorbar=dict(title=target_name),
+        ))
+        figc.add_trace(go.Scatter(
+            x=data["Stearic acid"], y=data["Tween 80"], mode="markers",
+            marker=dict(size=10, color="#C97A2B", symbol="x"), name="Experimental runs",
+        ))
+        figc.update_layout(
+            xaxis_title="Stearic acid (mg)", yaxis_title="Tween 80 (mg)",
+            height=520, margin=dict(l=10, r=10, t=20, b=10),
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(family="Inter, sans-serif", color="#101820"),
+        )
+        st.plotly_chart(figc, width='stretch')
 
 # ---------------- Optimization ----------------
 elif page == "Optimization":
-    st.title("Desirability Optimization")
+    render_header(
+        "Desirability",
+        "Formulation Optimization",
+        "Best experimental run by desirability = (Entrapment efficiency × Drug content) / Particle size.",
+    )
     desirability = (y["Entrapment efficiency"] * y["Drug content"]) / y["Particle size"]
     best_idx = desirability.idxmax()
-    st.write("Best formulation (experimental validation):")
-    st.write(data.loc[best_idx])
+    best_row = data.loc[best_idx]
+
+    st.markdown("#### Best formulation (experimental validation)")
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Run", int(best_row["Runs"]))
+    m2.metric("Stearic acid", f"{best_row['Stearic acid']:.0f} mg")
+    m3.metric("Tween 80", f"{best_row['Tween 80']:.0f} mg")
+    m4.metric("Entrapment eff.", f"{best_row['Entrapment efficiency']:.3f}")
+    m5.metric("Drug content", f"{best_row['Drug content']:.3f}")
+    m6.metric("Particle size", f"{best_row['Particle size']:.1f} nm")
+
+    st.dataframe(data.loc[[best_idx]], width='stretch', hide_index=True)
     st.caption(
         "Desirability = (Entrapment efficiency × Drug content) / Particle size, "
         "evaluated on the actual experimental runs (not model-predicted)."
@@ -407,33 +587,45 @@ elif page == "Optimization":
 
 # ---------------- Outlier Analysis ----------------
 elif page == "Outlier Analysis":
-    st.title("Outlier Detection")
+    render_header("Quality Control", "Outlier Detection", "Boxplots and z-score screening across every variable.")
 
-    st.subheader("Independent Variables - Boxplots")
-    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-    axes[0].boxplot(data["Stearic acid"]); axes[0].set_title("Stearic acid")
-    axes[1].boxplot(data["Tween 80"]); axes[1].set_title("Tween 80")
-    st.pyplot(fig)
+    st.markdown("#### Independent Variables")
+    fig = make_subplots(rows=1, cols=2, subplot_titles=["Stearic acid", "Tween 80"])
+    fig.add_trace(go.Box(y=data["Stearic acid"], name="Stearic acid", marker_color="#0E6E62", boxmean=True), row=1, col=1)
+    fig.add_trace(go.Box(y=data["Tween 80"], name="Tween 80", marker_color="#0E6E62", boxmean=True), row=1, col=2)
+    fig.update_layout(showlegend=False, height=380, margin=dict(l=10, r=10, t=40, b=10),
+                       paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                       font=dict(family="Inter, sans-serif", color="#101820"))
+    st.plotly_chart(fig, width='stretch')
 
-    st.subheader("Dependent Variables - Boxplots")
-    fig2, axes2 = plt.subplots(1, 4, figsize=(18, 5))
-    axes2[0].boxplot(data["Entrapment efficiency"]); axes2[0].set_title("Entrapment efficiency")
-    axes2[1].boxplot(data["Drug content"]); axes2[1].set_title("Drug content")
-    axes2[2].boxplot(data["Drug release"]); axes2[2].set_title("Drug release")
-    axes2[3].boxplot(data["Particle size"]); axes2[3].set_title("Particle size")
-    st.pyplot(fig2)
+    st.markdown("#### Dependent Variables")
+    dep_cols = ["Entrapment efficiency", "Drug content", "Drug release", "Particle size"]
+    fig2 = make_subplots(rows=1, cols=4, subplot_titles=dep_cols)
+    for i, col in enumerate(dep_cols, start=1):
+        fig2.add_trace(go.Box(y=data[col], name=col, marker_color="#C97A2B", boxmean=True), row=1, col=i)
+    fig2.update_layout(showlegend=False, height=380, margin=dict(l=10, r=10, t=40, b=10),
+                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                        font=dict(family="Inter, sans-serif", color="#101820"))
+    st.plotly_chart(fig2, width='stretch')
 
-    st.subheader("Z-Score Outlier Detection")
+    st.markdown("#### Z-Score Outlier Detection")
     numeric_data = data.select_dtypes(include=[np.number])
     z_scores = np.abs(zscore(numeric_data))
     outliers = (z_scores > 2).any(axis=1)
 
-    fig3, ax3 = plt.subplots()
-    ax3.scatter(range(len(data)), data["Entrapment efficiency"], c=~outliers, cmap="coolwarm")
-    ax3.set_xlabel("Run Index")
-    ax3.set_ylabel("Entrapment efficiency")
-    ax3.set_title("Outlier Detection (Entrapment efficiency)")
-    st.pyplot(fig3)
+    fig3 = go.Figure()
+    fig3.add_trace(go.Scatter(
+        x=list(range(len(data))), y=data["Entrapment efficiency"], mode="markers",
+        marker=dict(size=12, color=np.where(outliers, "#C97A2B", "#0E6E62")),
+        text=[f"Run {r}" for r in data["Runs"]], hovertemplate="%{text}<br>%{y}<extra></extra>",
+    ))
+    fig3.update_layout(
+        xaxis_title="Run Index", yaxis_title="Entrapment efficiency",
+        height=380, margin=dict(l=10, r=10, t=20, b=10),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Inter, sans-serif", color="#101820"),
+    )
+    st.plotly_chart(fig3, width='stretch')
 
-    st.write("### Outlier Runs (All Variables)")
+    st.markdown("#### Outlier Runs (All Variables)")
     st.write(data[outliers])

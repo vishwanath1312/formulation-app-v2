@@ -23,8 +23,31 @@ Drug Release** using multiple models and statistical methods.
   - SVR
   - XGBoost
 
+## Design
+
+The app has a deliberate visual identity rather than default Streamlit
+styling — a "lab instrument" look built for this specific dataset (a
+lipid-nanoparticle design-of-experiments dashboard):
+
+- **Palette:** cool near-white canvas (`#F5F7F8`), a single deep-teal accent
+  (`#0E6E62`), amber (`#C97A2B`) used sparingly to mark experimental runs on
+  charts.
+- **Type:** Space Grotesk for headings, Inter for body text, IBM Plex Mono
+  for every number/data table — figures read like instrument output rather
+  than marketing copy.
+- **Layout:** a dark teal/ink sidebar "console," a consistent eyebrow-label
+  + title header on every page, and a monospace "spec strip" of key facts
+  under the Dataset header.
+- **Charts:** all plots (3D response surfaces, contour plots, boxplots,
+  outlier scatter) are interactive Plotly charts in the matching palette,
+  not static matplotlib images.
+
+Theme colors are also set in `.streamlit/config.toml` so native widgets
+(sliders, buttons, inputs) pick up the same teal accent automatically.
+
 ## Pages
 
+- **Dataset** — the original 10-run experimental design matrix (all columns), summary statistics, and a CSV download
 - **Prediction** — enter Stearic acid / Tween 80 and get predictions (Entrapment efficiency, Drug content, Drug release, Particle size) from all six tuned models, with the best-performing model (⭐) flagged
 - **Reverse Prediction (Inverse Design)** — enter *target* outputs and the app searches the design space for the Stearic acid / Tween 80 combination that best achieves them, using the best-performing model by default
 - **Model Comparison** — leave-one-out cross-validated R², MAE, MSE, RMSE for all six models, plus the tuned hyperparameters found for each
@@ -77,6 +100,8 @@ formulation-app/
 ├── data/
 │   └── data of the formulation.xlsx
 ├── requirements.txt
+├── .streamlit/
+│   └── config.toml
 ├── .gitignore
 └── README.md
 ```
