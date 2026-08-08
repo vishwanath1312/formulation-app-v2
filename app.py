@@ -128,6 +128,18 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 TEAL_SCALE = [[0.0, "#F5F7F8"], [0.35, "#9FD6CB"], [0.7, "#33978A"], [1.0, "#0E6E62"]]
 
 
+def plot_config(filename):
+    """Config for st.plotly_chart: always-visible toolbar with a PNG export
+    button. This runs entirely client-side (Plotly.js), so it needs no
+    server-side rendering package (e.g. kaleido+Chrome), which keeps the
+    Streamlit Cloud deploy lightweight and reliable."""
+    return {
+        "displaylogo": False,
+        "displayModeBar": True,
+        "toImageButtonOptions": {"format": "png", "filename": filename, "scale": 2},
+    }
+
+
 def render_header(eyebrow, title, subtitle=None, facts=None):
     """Consistent hero header used at the top of every page."""
     st.markdown(f'<div class="app-eyebrow">{eyebrow}</div>', unsafe_allow_html=True)
@@ -539,7 +551,8 @@ elif page == "Response Surfaces":
             height=560, margin=dict(l=0, r=0, t=20, b=0),
             paper_bgcolor="rgba(0,0,0,0)", font=dict(family="Inter, sans-serif", color="#101820"),
         )
-        st.plotly_chart(fig3d, width='stretch')
+        st.plotly_chart(fig3d, width='stretch', config=plot_config(f"3d_surface_{target_name.replace(' ', '_').lower()}"))
+        st.caption("📷 Hover the chart and use the camera icon in the toolbar to download it as a PNG.")
 
     with tab_contour:
         figc = go.Figure(data=go.Contour(
@@ -557,7 +570,8 @@ elif page == "Response Surfaces":
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
             font=dict(family="Inter, sans-serif", color="#101820"),
         )
-        st.plotly_chart(figc, width='stretch')
+        st.plotly_chart(figc, width='stretch', config=plot_config(f"contour_{target_name.replace(' ', '_').lower()}"))
+        st.caption("📷 Hover the chart and use the camera icon in the toolbar to download it as a PNG.")
 
 # ---------------- Optimization ----------------
 elif page == "Optimization":
@@ -596,7 +610,8 @@ elif page == "Outlier Analysis":
     fig.update_layout(showlegend=False, height=380, margin=dict(l=10, r=10, t=40, b=10),
                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                        font=dict(family="Inter, sans-serif", color="#101820"))
-    st.plotly_chart(fig, width='stretch')
+    st.plotly_chart(fig, width='stretch', config=plot_config("independent_variables_boxplots"))
+    st.caption("📷 Hover the chart and use the camera icon in the toolbar to download it as a PNG.")
 
     st.markdown("#### Dependent Variables")
     dep_cols = ["Entrapment efficiency", "Drug content", "Drug release", "Particle size"]
@@ -606,7 +621,8 @@ elif page == "Outlier Analysis":
     fig2.update_layout(showlegend=False, height=380, margin=dict(l=10, r=10, t=40, b=10),
                         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                         font=dict(family="Inter, sans-serif", color="#101820"))
-    st.plotly_chart(fig2, width='stretch')
+    st.plotly_chart(fig2, width='stretch', config=plot_config("dependent_variables_boxplots"))
+    st.caption("📷 Hover the chart and use the camera icon in the toolbar to download it as a PNG.")
 
     st.markdown("#### Z-Score Outlier Detection")
     numeric_data = data.select_dtypes(include=[np.number])
@@ -625,7 +641,8 @@ elif page == "Outlier Analysis":
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family="Inter, sans-serif", color="#101820"),
     )
-    st.plotly_chart(fig3, width='stretch')
+    st.plotly_chart(fig3, width='stretch', config=plot_config("zscore_outlier_detection"))
+    st.caption("📷 Hover the chart and use the camera icon in the toolbar to download it as a PNG.")
 
     st.markdown("#### Outlier Runs (All Variables)")
     st.write(data[outliers])
