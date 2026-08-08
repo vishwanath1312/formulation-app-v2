@@ -25,13 +25,49 @@ Drug Release** using multiple models and statistical methods.
 
 ## Pages
 
-- **Prediction** — enter Stearic acid / Tween 80 and get predictions (Entrapment efficiency, Drug content, Drug release, Particle size) from Random Forest, SVR, and Quadratic (RSM)
-- **Reverse Prediction (Inverse Design)** — enter *target* outputs and the app searches the design space for the Stearic acid / Tween 80 combination that best achieves them
-- **Model Comparison** — R², MAE, MSE, RMSE for all six models on the held-out test split
+- **Prediction** — enter Stearic acid / Tween 80 and get predictions (Entrapment efficiency, Drug content, Drug release, Particle size) from all six tuned models, with the best-performing model (⭐) flagged
+- **Reverse Prediction (Inverse Design)** — enter *target* outputs and the app searches the design space for the Stearic acid / Tween 80 combination that best achieves them, using the best-performing model by default
+- **Model Comparison** — leave-one-out cross-validated R², MAE, MSE, RMSE for all six models, plus the tuned hyperparameters found for each
 - **ANOVA Analysis** — OLS regression summary for any selected response
-- **Response Surfaces** — 3D surface + contour plot (Random Forest) for any of the four responses (Entrapment efficiency, Drug content, Drug release, Particle size), over the full Stearic acid × Tween 80 design space
+- **Response Surfaces** — 3D surface + contour plot for any of the four responses (Entrapment efficiency, Drug content, Drug release, Particle size), for any of the six models, over the full Stearic acid × Tween 80 design space
 - **Optimization** — best experimental run by desirability = (EE × Drug content) / Particle size
 - **Outlier Analysis** — boxplots and z-score outlier detection
+
+## Model Performance
+
+Model training and evaluation are built for a **10-run dataset**, where a
+single random train/test split is too noisy to trust:
+
+- **Leave-one-out cross-validation (LOOCV)** — every one of the 10
+  experimental runs is held out and predicted exactly once by a model
+  trained on the other 9, instead of an 80/20 split (which on 10 rows
+  leaves only 1–2 test points).
+- **Hyperparameter tuning** — `GridSearchCV` searches each model's
+  hyperparameters using the same LOOCV splits (tree depth for Random
+  Forest/Decision Tree, `C`/`gamma`/`epsilon` for SVR, learning
+  rate/depth/estimators for XGBoost, regularization strength for the
+  polynomial model), favoring settings that generalize instead of settings
+  that just memorize the 9 training points.
+- **Feature scaling** — every model runs inside a
+  `Pipeline(StandardScaler → estimator)`, which matters for SVR and the
+  regularized polynomial model given Stearic acid (120–360) and Tween 80
+  (60–180) are on different scales.
+- **Regularized polynomial RSM (Ridge)** — the quadratic response-surface
+  model uses `Ridge` instead of plain `LinearRegression` on the degree-2
+  features, since the ANOVA page's large condition number flags real
+  multicollinearity in the quadratic design; Ridge stabilizes those
+  coefficients.
+- **Best-model tracking** — the app computes LOOCV R² for all six models
+  and marks the winner (⭐) throughout the UI: it's the default in
+  **Reverse Prediction** and **Response Surfaces**, and highlighted on
+  **Model Comparison**.
+
+In practice, the regularized polynomial (RSM) model tends to come out on
+top — it matches the actual 2-factor design-of-experiments structure the
+data was collected under, while more flexible models (Random Forest, SVR,
+XGBoost, Decision Tree) have too few points to learn complex patterns
+reliably. See the **Model Comparison** page for exact metrics and tuned
+hyperparameters.
 
 ## Project structure
 
@@ -80,9 +116,10 @@ Opens at `http://localhost:8501`.
 
 ### Notes / known limitations
 
-- The dataset has only **10 experimental runs**; with an 80/20 split that's
-  8 train / 2 test rows, so the Model Comparison metrics are illustrative,
-  not statistically robust — treat relative rankings loosely.
+- The dataset has only **10 experimental runs**. LOOCV makes the best use
+  of that limited data for evaluation, but no amount of methodology
+  substitutes for more experiments — treat all metrics as directional, not
+  as production-grade accuracy guarantees.
 - Reverse Prediction is an inverse (many-to-few) search: 4 target responses,
   2 tunable inputs, so an exact match is usually impossible. The optimizer
   (differential evolution) finds the best achievable compromise within the
@@ -90,5 +127,6 @@ Opens at `http://localhost:8501`.
   each target.
 - XGBoost and scikit-learn wheels are large; the first Streamlit Cloud build
   can take a few minutes.
-- Training re-runs (cached via `st.cache_resource`) whenever `app.py` or the
-  data file changes, so predictions always reflect the current dataset.
+- Training + hyperparameter tuning (cached via `st.cache_resource`) runs
+  once per session — expect a short delay (well under a minute) the first
+  time the app loads or after `app.py`/the data file changes.

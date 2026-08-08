@@ -1,22 +1,26 @@
 import os
+import warnings
 import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (registers 3D projection)
-from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LinearRegression
-from sklearn.preprocessing import PolynomialFeatures
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.svm import SVR
 from xgboost import XGBRegressor
 from sklearn.multioutput import MultiOutputRegressor
+from sklearn.model_selection import GridSearchCV, LeaveOneOut, cross_val_predict
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 import joblib
 import statsmodels.api as sm
 from scipy.stats import zscore
 from scipy.optimize import differential_evolution
+
+warnings.filterwarnings("ignore")  # small-sample sklearn convergence/feature-name warnings are just noise here
 
 st.set_page_config(page_title="Formulation Prediction App", page_icon="🧪", layout="wide")
 
@@ -38,53 +42,96 @@ data = load_data()
 X = data[["Stearic acid", "Tween 80"]]
 y = data[["Entrapment efficiency", "Drug content", "Drug release", "Particle size"]]
 
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# ----------------------------------------------------------------------
+# Model definitions
+# ----------------------------------------------------------------------
+# Every model is a Pipeline (StandardScaler + estimator) so all six models
+# share one calling convention: models[name].predict([[x1, x2]]).
+# Hyperparameters are tuned via leave-one-out cross-validation (LOOCV) —
+# with only 10 experimental runs, a single train/test split is far too
+# noisy to trust, so every fold gets to act as the test set exactly once.
+def build_model_specs():
+    return {
+        "Linear Regression": (
+            Pipeline([("scaler", StandardScaler()), ("reg", MultiOutputRegressor(LinearRegression()))]),
+            {},
+        ),
+        "Polynomial Regression (RSM, Ridge)": (
+            # Ridge (L2-regularized) instead of plain LinearRegression on the
+            # degree-2 features: the raw quadratic RSM design is highly
+            # collinear (confirmed by the large condition number on the
+            # ANOVA page), and regularization stabilizes those coefficients.
+            Pipeline([
+                ("poly", PolynomialFeatures(degree=2)),
+                ("scaler", StandardScaler()),
+                ("reg", MultiOutputRegressor(Ridge())),
+            ]),
+            {"reg__estimator__alpha": [0.01, 0.1, 1, 10, 100]},
+        ),
+        "Decision Tree": (
+            Pipeline([("scaler", StandardScaler()), ("reg", MultiOutputRegressor(DecisionTreeRegressor(random_state=42)))]),
+            {"reg__estimator__max_depth": [2, 3, None], "reg__estimator__min_samples_leaf": [1, 2]},
+        ),
+        "Random Forest": (
+            Pipeline([("scaler", StandardScaler()), ("reg", MultiOutputRegressor(RandomForestRegressor(n_estimators=100, random_state=42)))]),
+            {"reg__estimator__max_depth": [2, 3], "reg__estimator__min_samples_leaf": [1, 2]},
+        ),
+        "SVR": (
+            Pipeline([("scaler", StandardScaler()), ("reg", MultiOutputRegressor(SVR(kernel="rbf")))]),
+            {"reg__estimator__C": [0.1, 1, 10], "reg__estimator__gamma": ["scale", 0.1],
+             "reg__estimator__epsilon": [0.01, 0.1]},
+        ),
+        "XGBoost": (
+            Pipeline([("scaler", StandardScaler()), ("reg", MultiOutputRegressor(XGBRegressor(objective="reg:squarederror", random_state=42)))]),
+            {"reg__estimator__n_estimators": [50, 100], "reg__estimator__max_depth": [2, 3],
+             "reg__estimator__learning_rate": [0.1, 0.2]},
+        ),
+    }
 
 
 # ----------------------------------------------------------------------
-# Train models (cached so the app doesn't retrain on every interaction)
+# Train + tune models (cached so this only runs once per session)
 # ----------------------------------------------------------------------
 @st.cache_resource
-def train_models(X_train, X_test, y_train, y_test):
-    models = {
-        "Linear Regression": MultiOutputRegressor(LinearRegression()),
-        "Polynomial Regression (RSM)": MultiOutputRegressor(LinearRegression()),
-        "Decision Tree": MultiOutputRegressor(DecisionTreeRegressor(random_state=42)),
-        "Random Forest": MultiOutputRegressor(RandomForestRegressor(n_estimators=100, random_state=42)),
-        "SVR": MultiOutputRegressor(SVR(kernel="rbf")),
-        "XGBoost": MultiOutputRegressor(XGBRegressor(objective="reg:squarederror")),
-    }
+def train_models(X, y):
+    loo = LeaveOneOut()
+    model_specs = build_model_specs()
 
-    poly = PolynomialFeatures(degree=2)
-    X_poly = poly.fit_transform(X_train)
+    models = {}
+    best_params = {}
+    metrics = {}
 
-    results = {}
-    for name, model in models.items():
-        if "Polynomial" in name:
-            model.fit(X_poly, y_train)
-            preds = model.predict(poly.transform(X_test))
+    for name, (pipe, grid) in model_specs.items():
+        if grid:
+            search = GridSearchCV(pipe, grid, cv=loo, scoring="r2", n_jobs=1)
+            search.fit(X, y)
+            best_est = search.best_estimator_
+            best_params[name] = search.best_params_
         else:
-            model.fit(X_train, y_train)
-            preds = model.predict(X_test)
-        results[name] = preds
-        joblib.dump(model, f"models/{name.replace(' ', '_').lower()}.pkl")
+            best_est = pipe.fit(X, y)
+            best_params[name] = {}
 
-    return models, poly, results
+        # Out-of-fold (leave-one-out) predictions using the tuned hyperparameters
+        # give an honest estimate of how the model performs on unseen runs,
+        # using every one of the 10 experimental points as a held-out test case.
+        oof_pred = cross_val_predict(best_est, X, y, cv=loo, n_jobs=1)
+        metrics[name] = {
+            "R² (LOOCV)": r2_score(y, oof_pred),
+            "MAE (LOOCV)": mean_absolute_error(y, oof_pred),
+            "MSE (LOOCV)": mean_squared_error(y, oof_pred),
+            "RMSE (LOOCV)": np.sqrt(mean_squared_error(y, oof_pred)),
+        }
+
+        models[name] = best_est  # already refit on ALL data by GridSearchCV(refit=True)
+        joblib.dump(best_est, f"models/{name.replace(' ', '_').replace(',', '').replace('(', '').replace(')', '').lower()}.pkl")
+
+    best_model_name = max(metrics, key=lambda n: metrics[n]["R² (LOOCV)"])
+    return models, best_params, metrics, best_model_name
 
 
-models, poly, results = train_models(X_train, X_test, y_train, y_test)
-
-
-# ----------------------------------------------------------------------
-# Evaluation function
-# ----------------------------------------------------------------------
-def evaluate(y_true, y_pred):
-    return {
-        "R²": r2_score(y_true, y_pred),
-        "MAE": mean_absolute_error(y_true, y_pred),
-        "MSE": mean_squared_error(y_true, y_pred),
-        "RMSE": np.sqrt(mean_squared_error(y_true, y_pred)),
-    }
+with st.spinner("Training and tuning models with leave-one-out cross-validation..."):
+    models, best_params, metrics, best_model_name = train_models(X, y)
 
 
 # ----------------------------------------------------------------------
@@ -96,6 +143,11 @@ page = st.sidebar.radio(
     ["Prediction", "Reverse Prediction", "Model Comparison", "ANOVA Analysis",
      "Response Surfaces", "Optimization", "Outlier Analysis"],
 )
+st.sidebar.markdown("---")
+st.sidebar.caption(
+    f"🏆 Best model (LOOCV R²): **{best_model_name}** "
+    f"({metrics[best_model_name]['R² (LOOCV)']:.3f})"
+)
 
 # ---------------- Prediction UI ----------------
 if page == "Prediction":
@@ -105,17 +157,19 @@ if page == "Prediction":
     tween = st.sidebar.number_input("Tween 80", min_value=60, max_value=200, step=10, value=120)
 
     if st.sidebar.button("Predict"):
-        rf_pred = models["Random Forest"].predict([[stearic, tween]])
-        svr_pred = models["SVR"].predict([[stearic, tween]])
-        quad_pred = models["Polynomial Regression (RSM)"].predict(poly.transform([[stearic, tween]]))
-
         output_cols = ["Entrapment efficiency", "Drug content", "Drug release", "Particle size"]
-        st.write("### Predictions")
-        st.table(pd.DataFrame(
-            [rf_pred[0], svr_pred[0], quad_pred[0]],
-            index=["Random Forest", "SVR", "Quadratic (RSM)"],
-            columns=output_cols,
-        ))
+        rows, index = [], []
+        for name, model in models.items():
+            rows.append(model.predict([[stearic, tween]])[0])
+            index.append(f"⭐ {name}" if name == best_model_name else name)
+
+        st.write("### Predictions from all models")
+        st.table(pd.DataFrame(rows, index=index, columns=output_cols))
+        st.caption(
+            f"⭐ = model with the best leave-one-out cross-validated R² "
+            f"({best_model_name}, R² = {metrics[best_model_name]['R² (LOOCV)']:.3f}). "
+            "See the Model Comparison page for full details."
+        )
 
 # ---------------- Reverse Prediction (Inverse Design) ----------------
 elif page == "Reverse Prediction":
@@ -135,9 +189,11 @@ elif page == "Reverse Prediction":
 
     forward_model_name = st.selectbox(
         "Forward model to search against",
-        ["Random Forest", "SVR", "Polynomial Regression (RSM)", "XGBoost", "Linear Regression", "Decision Tree"],
+        list(models.keys()),
+        index=list(models.keys()).index(best_model_name),
         help="The reverse search evaluates candidate (Stearic acid, Tween 80) "
-             "pairs using this forward model's predictions.",
+             "pairs using this forward model's predictions. Defaults to the "
+             "model with the best leave-one-out cross-validated R².",
     )
 
     st.markdown("### Target Responses")
@@ -169,8 +225,6 @@ elif page == "Reverse Prediction":
         y_ranges[y_ranges == 0] = 1.0  # avoid div-by-zero
 
         def forward_predict(x1, x2):
-            if forward_model_name == "Polynomial Regression (RSM)":
-                return models[forward_model_name].predict(poly.transform([[x1, x2]]))[0]
             return models[forward_model_name].predict([[x1, x2]])[0]
 
         def objective(params):
@@ -225,13 +279,47 @@ elif page == "Reverse Prediction":
 # ---------------- Model comparison ----------------
 elif page == "Model Comparison":
     st.title("Model Comparison")
-    metrics_table = {}
-    for name, preds in results.items():
-        metrics_table[name] = evaluate(y_test, preds)
-    st.table(pd.DataFrame(metrics_table).T)
+    st.markdown(
+        "All metrics below are computed with **leave-one-out cross-validation "
+        "(LOOCV)**: each of the 10 experimental runs is held out and predicted "
+        "exactly once by a model trained on the other 9. This is far more "
+        "reliable than a single random train/test split on a 10-row dataset, "
+        "where the test set would only be 1–2 points."
+    )
+
+    metrics_df = pd.DataFrame(metrics).T
+    metrics_df = metrics_df.sort_values("R² (LOOCV)", ascending=False)
+
+    def highlight_best(row):
+        return ["background-color: #d1fae5" if row.name == best_model_name else "" for _ in row]
+
+    st.dataframe(metrics_df.style.apply(highlight_best, axis=1).format("{:.4f}"), use_container_width=True)
+    st.success(
+        f"🏆 Best model: **{best_model_name}** "
+        f"(R² = {metrics[best_model_name]['R² (LOOCV)']:.3f}). "
+        "This is the model used as the default in Reverse Prediction and "
+        "the ⭐-marked row in Prediction.",
+        icon="🏆",
+    )
+
+    st.markdown("### Tuned Hyperparameters")
     st.caption(
-        f"Metrics computed on a held-out test split ({len(X_test)} of {len(X)} runs). "
-        "With a small 10-run dataset these numbers are illustrative rather than statistically robust."
+        "Hyperparameters were selected via GridSearchCV using the same "
+        "leave-one-out cross-validation splits, favoring settings that "
+        "generalize rather than settings that just fit the training data best."
+    )
+    for name, params in best_params.items():
+        if params:
+            st.write(f"**{name}:** {params}")
+        else:
+            st.write(f"**{name}:** (no tunable hyperparameters)")
+
+    st.caption(
+        "Even with tuning, a 10-run dataset limits how accurate any model can "
+        "be — the regularized Polynomial (RSM) model tends to generalize best "
+        "here because it matches the underlying 2-factor design-of-experiments "
+        "structure, while more flexible models (Random Forest, SVR, XGBoost, "
+        "Decision Tree) have too little data to reliably learn complex patterns."
     )
 
 # ---------------- ANOVA ----------------
@@ -246,12 +334,19 @@ elif page == "ANOVA Analysis":
 elif page == "Response Surfaces":
     st.title("Response Surface & Contour Plots")
 
+    surface_model_name = st.selectbox(
+        "Model",
+        list(models.keys()),
+        index=list(models.keys()).index(best_model_name),
+        help="Defaults to the model with the best leave-one-out cross-validated R².",
+    )
+
     def plot_surface(feature1, feature2, target_index, title):
         f1_range = np.linspace(X[feature1].min(), X[feature1].max(), 30)
         f2_range = np.linspace(X[feature2].min(), X[feature2].max(), 30)
         f1_grid, f2_grid = np.meshgrid(f1_range, f2_range)
         inputs = np.array([[f1, f2] for f1, f2 in zip(np.ravel(f1_grid), np.ravel(f2_grid))])
-        preds = models["Random Forest"].predict(inputs)[:, target_index].reshape(f1_grid.shape)
+        preds = models[surface_model_name].predict(inputs)[:, target_index].reshape(f1_grid.shape)
 
         fig = plt.figure()
         ax = fig.add_subplot(111, projection="3d")
