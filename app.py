@@ -140,7 +140,7 @@ with st.spinner("Training and tuning models with leave-one-out cross-validation.
 st.sidebar.title("Navigation")
 page = st.sidebar.radio(
     "Go to",
-    ["Prediction", "Reverse Prediction", "Model Comparison", "ANOVA Analysis",
+    ["Dataset", "Prediction", "Reverse Prediction", "Model Comparison", "ANOVA Analysis",
      "Response Surfaces", "Optimization", "Outlier Analysis"],
 )
 st.sidebar.markdown("---")
@@ -149,8 +149,27 @@ st.sidebar.caption(
     f"({metrics[best_model_name]['R² (LOOCV)']:.3f})"
 )
 
+# ---------------- Dataset ----------------
+if page == "Dataset":
+    st.title("Original Dataset")
+    st.markdown(
+        "The raw experimental design matrix loaded from "
+        f"`{DATA_PATH}` — {data.shape[0]} runs × {data.shape[1]} columns."
+    )
+    st.dataframe(data, use_container_width=True, hide_index=True)
+
+    st.markdown("### Summary Statistics")
+    st.dataframe(data.describe().T, use_container_width=True)
+
+    st.download_button(
+        "Download dataset as CSV",
+        data.to_csv(index=False),
+        file_name="data_of_the_formulation.csv",
+        mime="text/csv",
+    )
+
 # ---------------- Prediction UI ----------------
-if page == "Prediction":
+elif page == "Prediction":
     st.title("Formulation Prediction App")
     st.sidebar.header("Input Parameters")
     stearic = st.sidebar.number_input("Stearic acid", min_value=60, max_value=400, step=10, value=240)
