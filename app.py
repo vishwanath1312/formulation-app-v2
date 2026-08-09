@@ -17,8 +17,17 @@ from sklearn.model_selection import GridSearchCV, LeaveOneOut, cross_val_predict
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 import joblib
 import statsmodels.api as sm
+import statsmodels.formula.api as smf
 from scipy.stats import zscore
+from scipy import stats as scipy_stats
 from scipy.optimize import differential_evolution
+from io import BytesIO
+from docx import Document
+from docx.shared import Pt, Cm, RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
 
 warnings.filterwarnings("ignore")  # small-sample sklearn convergence/feature-name warnings are just noise here
 
@@ -128,18 +137,6 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 TEAL_SCALE = [[0.0, "#F5F7F8"], [0.35, "#9FD6CB"], [0.7, "#33978A"], [1.0, "#0E6E62"]]
 
 
-def plot_config(filename):
-    """Config for st.plotly_chart: always-visible toolbar with a PNG export
-    button. This runs entirely client-side (Plotly.js), so it needs no
-    server-side rendering package (e.g. kaleido+Chrome), which keeps the
-    Streamlit Cloud deploy lightweight and reliable."""
-    return {
-        "displaylogo": False,
-        "displayModeBar": True,
-        "toImageButtonOptions": {"format": "png", "filename": filename, "scale": 2},
-    }
-
-
 def render_header(eyebrow, title, subtitle=None, facts=None):
     """Consistent hero header used at the top of every page."""
     st.markdown(f'<div class="app-eyebrow">{eyebrow}</div>', unsafe_allow_html=True)
@@ -170,6 +167,210 @@ def load_data():
 data = load_data()
 X = data[["Stearic acid", "Tween 80"]]
 y = data[["Entrapment efficiency", "Drug content", "Drug release", "Particle size"]]
+
+
+# ----------------------------------------------------------------------
+# Journal-ready RSM ANOVA (Design-Expert-style quadratic model)
+# ----------------------------------------------------------------------
+# Fits the standard second-order response-surface model
+#   y = b0 + b1*A + b2*B + b12*AB + b11*A^2 + b22*B^2
+# and decomposes it into the ANOVA table format expected by formulation /
+# pharmaceutics journals (Model, each term, Residual, Lack of Fit, Pure
+# Error, Cor Total), plus the fit-quality statistics (R^2, Adjusted R^2,
+# Predicted R^2, Adequate Precision, %CV) that reviewers expect to see
+# alongside it. This intentionally uses plain (unregularized) OLS, since
+# that is the convention every RSM/DoE paper and Design-Expert itself
+# follows for this table — the ⭐ prediction models elsewhere in the app
+# remain the tuned/regularized pipelines used for actual predictions.
+RSM_TERM_LABELS = {
+    "A": "A — Stearic acid", "B": "B — Tween 80", "AB": "AB",
+    "A2": "A²", "B2": "B²",
+}
+
+
+@st.cache_data
+def compute_rsm_anova(data_in, response, x1="Stearic acid", x2="Tween 80"):
+    df = data_in.rename(columns={x1: "A", x2: "B", response: "y"})
+    df["AB"] = df["A"] * df["B"]
+    df["A2"] = df["A"] ** 2
+    df["B2"] = df["B"] ** 2
+
+    n = len(df)
+    model = smf.ols("y ~ A + B + AB + A2 + B2", data=df).fit()
+    p_params = int(model.df_model) + 1
+    resid_df = int(model.df_resid)
+    model_df = int(model.df_model)
+
+    ss_total = float(np.sum((df["y"] - df["y"].mean()) ** 2))
+    ss_resid = float(np.sum(model.resid ** 2))
+    ss_model = ss_total - ss_resid
+    ms_model = ss_model / model_df
+    ms_resid = ss_resid / resid_df
+    f_model = ms_model / ms_resid
+    p_model = float(1 - scipy_stats.f.cdf(f_model, model_df, resid_df))
+
+    # Lack of fit / pure error, using any replicated (A, B) design points
+    pure_error_ss, pure_error_df = 0.0, 0
+    for _, g in df.groupby(["A", "B"])["y"]:
+        if len(g) > 1:
+            pure_error_ss += float(np.sum((g - g.mean()) ** 2))
+            pure_error_df += len(g) - 1
+    lof_ss = ss_resid - pure_error_ss
+    lof_df = resid_df - pure_error_df
+    has_replicates = pure_error_df > 0
+    ms_lof = lof_ss / lof_df if lof_df > 0 else np.nan
+    ms_pe = pure_error_ss / pure_error_df if has_replicates else np.nan
+    f_lof = ms_lof / ms_pe if has_replicates and lof_df > 0 else np.nan
+    p_lof = float(1 - scipy_stats.f.cdf(f_lof, lof_df, pure_error_df)) if has_replicates and lof_df > 0 else np.nan
+
+    def sig_label(pval):
+        if pval is None or (isinstance(pval, float) and np.isnan(pval)):
+            return ""
+        return "significant" if pval < 0.05 else "not significant"
+
+    rows = [{"Source": "Model", "SS": ss_model, "df": model_df, "MS": ms_model,
+             "F-value": f_model, "p-value (Prob > F)": p_model, "": sig_label(p_model)}]
+    for term in ["A", "B", "AB", "A2", "B2"]:
+        t = model.tvalues[term]
+        pval = float(model.pvalues[term])
+        f_term = t ** 2
+        ss_term = f_term * ms_resid
+        rows.append({"Source": RSM_TERM_LABELS[term], "SS": ss_term, "df": 1, "MS": ss_term,
+                     "F-value": f_term, "p-value (Prob > F)": pval, "": sig_label(pval)})
+    rows.append({"Source": "Residual", "SS": ss_resid, "df": resid_df, "MS": ms_resid,
+                 "F-value": np.nan, "p-value (Prob > F)": np.nan, "": ""})
+    rows.append({"Source": "Lack of Fit", "SS": lof_ss, "df": lof_df, "MS": ms_lof,
+                 "F-value": f_lof, "p-value (Prob > F)": p_lof,
+                 "": sig_label(p_lof) if has_replicates else "n/a (no replicates)"})
+    rows.append({"Source": "Pure Error", "SS": pure_error_ss, "df": pure_error_df, "MS": ms_pe,
+                 "F-value": np.nan, "p-value (Prob > F)": np.nan, "": ""})
+    rows.append({"Source": "Cor Total", "SS": ss_total, "df": n - 1, "MS": np.nan,
+                 "F-value": np.nan, "p-value (Prob > F)": np.nan, "": ""})
+    anova_df = pd.DataFrame(rows)
+
+    # Predicted R^2 via PRESS (leave-one-out deletion residuals from the hat matrix)
+    hat = model.get_influence().hat_matrix_diag
+    press = float(np.sum((model.resid / (1 - hat)) ** 2))
+    pred_r2 = 1 - press / ss_total
+
+    adeq_precision = (model.fittedvalues.max() - model.fittedvalues.min()) / np.sqrt(p_params * ms_resid / n)
+    cv_pct = np.sqrt(ms_resid) / df["y"].mean() * 100
+
+    fit_stats = {
+        "R²": model.rsquared, "Adjusted R²": model.rsquared_adj, "Predicted R²": pred_r2,
+        "Adequate Precision": adeq_precision, "C.V. %": cv_pct,
+        "Std. Dev.": np.sqrt(ms_resid), "Mean": df["y"].mean(), "PRESS": press,
+    }
+
+    # Equation in actual factors (raw units)
+    c = model.params
+    eq_actual = (
+        f"{response} = {c['Intercept']:+.6g} {c['A']:+.6g}·A {c['B']:+.6g}·B "
+        f"{c['AB']:+.6g}·AB {c['A2']:+.6g}·A² {c['B2']:+.6g}·B²"
+    )
+
+    # Equation in coded factors (-1 / +1 over the explored range) — coefficient
+    # magnitude is then directly comparable across terms, as journals show it.
+    df_coded = df.copy()
+    for col in ["A", "B"]:
+        lo, hi = df[col].min(), df[col].max()
+        mid, half = (hi + lo) / 2, (hi - lo) / 2
+        df_coded[col] = (df[col] - mid) / half
+    df_coded["AB"] = df_coded["A"] * df_coded["B"]
+    df_coded["A2"] = df_coded["A"] ** 2
+    df_coded["B2"] = df_coded["B"] ** 2
+    model_coded = smf.ols("y ~ A + B + AB + A2 + B2", data=df_coded).fit()
+    cc = model_coded.params
+    eq_coded = (
+        f"{response} = {cc['Intercept']:+.6g} {cc['A']:+.6g}·A {cc['B']:+.6g}·B "
+        f"{cc['AB']:+.6g}·AB {cc['A2']:+.6g}·A² {cc['B2']:+.6g}·B²"
+    )
+
+    # Multicollinearity check (condition number on the coded design matrix)
+    cond_no = float(model_coded.condition_number)
+
+    return {
+        "anova_df": anova_df, "fit_stats": fit_stats, "eq_actual": eq_actual,
+        "eq_coded": eq_coded, "cond_no": cond_no, "p_model": p_model, "p_lof": p_lof,
+        "has_replicates": has_replicates, "n": n, "model_df": model_df, "resid_df": resid_df,
+    }
+
+
+def _docx_set_cell_shading(cell, hex_color):
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:fill"), hex_color)
+    cell._tc.get_or_add_tcPr().append(shd)
+
+
+def build_anova_docx(response, result):
+    """Builds a journal-style Table (ANOVA + fit statistics + equation) as a .docx in memory."""
+    doc = Document()
+    style = doc.styles["Normal"]
+    style.font.name = "Times New Roman"
+    style.font.size = Pt(11)
+
+    title = doc.add_paragraph()
+    run = title.add_run(f"Table. ANOVA for Response Surface Quadratic Model — {response}")
+    run.bold = True
+    run.font.size = Pt(11)
+
+    anova_df = result["anova_df"]
+    n_rows, n_cols = anova_df.shape[0] + 1, anova_df.shape[1]
+    table = doc.add_table(rows=n_rows, cols=n_cols)
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    table.style = "Table Grid"
+
+    headers = list(anova_df.columns)
+    headers[-1] = "Significance"
+    for j, h in enumerate(headers):
+        cell = table.rows[0].cells[j]
+        cell.text = h
+        cell.paragraphs[0].runs[0].bold = True
+        cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+        _docx_set_cell_shading(cell, "D6EFE9")
+
+    for i, row in anova_df.iterrows():
+        for j, col in enumerate(anova_df.columns):
+            val = row[col]
+            if col in ("SS", "MS"):
+                text = "" if pd.isna(val) else f"{val:.4f}"
+            elif col == "F-value":
+                text = "" if pd.isna(val) else f"{val:.2f}"
+            elif col == "p-value (Prob > F)":
+                text = "" if pd.isna(val) else ("< 0.0001" if val < 0.0001 else f"{val:.4f}")
+            elif col == "df":
+                text = "" if pd.isna(val) else f"{int(val)}"
+            else:
+                text = str(val)
+            cell = table.rows[i + 1].cells[j]
+            cell.text = text
+            cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+            if row["Source"] in ("Model", "Cor Total"):
+                for r in cell.paragraphs[0].runs:
+                    r.bold = True
+
+    doc.add_paragraph()
+    fs = result["fit_stats"]
+    fs_para = doc.add_paragraph()
+    fs_para.add_run(
+        f"R² = {fs['R²']:.4f}; Adjusted R² = {fs['Adjusted R²']:.4f}; "
+        f"Predicted R² = {fs['Predicted R²']:.4f}; Adequate Precision = "
+        f"{fs['Adequate Precision']:.3f}; C.V.% = {fs['C.V. %']:.2f}; "
+        f"Std. Dev. = {fs['Std. Dev.']:.4f}."
+    ).italic = True
+
+    doc.add_paragraph()
+    eq_para = doc.add_paragraph()
+    eq_para.add_run("Final Equation in Terms of Actual Factors:").bold = True
+    doc.add_paragraph(result["eq_actual"])
+    eq_para2 = doc.add_paragraph()
+    eq_para2.add_run("Final Equation in Terms of Coded Factors:").bold = True
+    doc.add_paragraph(result["eq_coded"])
+
+    buf = BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf
 
 
 # ----------------------------------------------------------------------
@@ -500,11 +701,141 @@ elif page == "Model Comparison":
 
 # ---------------- ANOVA ----------------
 elif page == "ANOVA Analysis":
-    render_header("Statistics", "ANOVA Analysis", "OLS regression summary for any selected response.")
+    render_header(
+        "Response Surface Methodology",
+        "ANOVA for the Quadratic Model",
+        "Design-Expert-style analysis of variance, ready to report in a journal "
+        "Results section: significance of the quadratic model and each term, "
+        "lack-of-fit test, fit statistics, and the final regression equation.",
+    )
     response_name = st.selectbox("Response", y.columns.tolist())
-    X_const = sm.add_constant(X)
-    model = sm.OLS(y[response_name], X_const).fit()
-    st.text(model.summary())
+    result = compute_rsm_anova(data, response_name)
+    anova_df = result["anova_df"]
+    fs = result["fit_stats"]
+
+    st.caption(
+        "Fitted model: y = b₀ + b₁A + b₂B + b₁₂AB + b₁₁A² + b₂₂B², where A = "
+        "Stearic acid and B = Tween 80. This is plain (unregularized) OLS — the "
+        "convention this table follows in RSM/DoE papers — and is separate from "
+        "the tuned/regularized models used elsewhere in the app for prediction."
+    )
+
+    p_model_str = "p < 0.0001" if result["p_model"] < 0.0001 else f"p = {result['p_model']:.4f}"
+    if result["p_model"] < 0.05:
+        model_f_value = anova_df.loc[anova_df["Source"] == "Model", "F-value"].iloc[0]
+        st.success(
+            f"The Model F-value of {model_f_value:.2f} implies the model is "
+            f"significant ({p_model_str}). There is only a small chance that an "
+            "F-value this large could occur due to noise.",
+            icon="✅",
+        )
+    else:
+        st.warning(
+            f"The Model F-value implies the model is **not significant** "
+            f"(p = {result['p_model']:.4f}) — treat this response's equation as "
+            "exploratory rather than a validated predictive model.",
+            icon="⚠️",
+        )
+
+    if result["has_replicates"]:
+        if not np.isnan(result["p_lof"]) and result["p_lof"] >= 0.05:
+            st.info(
+                f"Lack of Fit p-value = {result['p_lof']:.4f} (not significant) — "
+                "this is desirable, meaning the quadratic model fits the data well "
+                "relative to the pure error from replicate runs.",
+                icon="ℹ️",
+            )
+        elif not np.isnan(result["p_lof"]):
+            st.warning(
+                f"Lack of Fit p-value = {result['p_lof']:.4f} (significant) — the "
+                "model may not adequately capture the true response surface for "
+                "this response.",
+                icon="⚠️",
+            )
+    else:
+        st.caption("No replicated design points for this response — Lack of Fit could not be tested against Pure Error.")
+
+    st.markdown("#### ANOVA Table")
+    display_df = anova_df.copy()
+    display_df["p-value (Prob > F)"] = display_df["p-value (Prob > F)"].apply(
+        lambda v: "" if pd.isna(v) else ("< 0.0001" if v < 0.0001 else f"{v:.4f}")
+    )
+    display_df["F-value"] = display_df["F-value"].apply(lambda v: "" if pd.isna(v) else f"{v:.2f}")
+    display_df["SS"] = display_df["SS"].apply(lambda v: "" if pd.isna(v) else f"{v:.4f}")
+    display_df["MS"] = display_df["MS"].apply(lambda v: "" if pd.isna(v) else f"{v:.4f}")
+    display_df["df"] = display_df["df"].apply(lambda v: "" if pd.isna(v) else f"{int(v)}")
+
+    def highlight_totals(row):
+        return ["font-weight: 600; background-color: #D6EFE9" if row["Source"] in ("Model", "Cor Total") else "" for _ in row]
+
+    st.dataframe(
+        display_df.style.apply(highlight_totals, axis=1),
+        width="stretch", hide_index=True,
+    )
+    st.caption("Significance judged at α = 0.05 (p < 0.05 = significant).")
+
+    st.markdown("#### Fit Statistics")
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("R²", f"{fs['R²']:.4f}")
+    m2.metric("Adjusted R²", f"{fs['Adjusted R²']:.4f}")
+    m3.metric("Predicted R²", f"{fs['Predicted R²']:.4f}")
+    m4.metric("Adeq Precision", f"{fs['Adequate Precision']:.3f}")
+    m5.metric("C.V. %", f"{fs['C.V. %']:.2f}")
+    m6.metric("Std. Dev.", f"{fs['Std. Dev.']:.4f}")
+
+    if abs(fs["Adjusted R²"] - fs["Predicted R²"]) > 0.2:
+        st.warning(
+            "The difference between Adjusted R² and Predicted R² is more than "
+            "0.2 — this can indicate a large block effect, a possible problem "
+            "with the model or data, or simply the limits of a 10-run design. "
+            "Report this caveat alongside the equation.",
+            icon="⚠️",
+        )
+    if fs["Adequate Precision"] < 4:
+        st.warning(
+            "Adequate Precision is below 4, indicating an inadequate signal-to-"
+            "noise ratio — this model should not be used to navigate the design "
+            "space for this response.",
+            icon="⚠️",
+        )
+    else:
+        st.caption(f"Adequate Precision = {fs['Adequate Precision']:.3f} (> 4 is desirable — indicates an adequate signal).")
+
+    if result["cond_no"] > 10:
+        st.caption(
+            f"Condition number (coded design) = {result['cond_no']:.1f} — "
+            + ("above the common rule-of-thumb of 10, indicating multicollinearity between quadratic terms."
+               if result["cond_no"] <= 30 else
+               "well above 10, indicating substantial multicollinearity between quadratic terms; interpret individual coefficients with caution.")
+        )
+
+    st.markdown("#### Final Equation")
+    tab_actual, tab_coded = st.tabs(["In Terms of Actual Factors", "In Terms of Coded Factors"])
+    with tab_actual:
+        st.code(result["eq_actual"], language=None)
+        st.caption("Use actual-factor coefficients to predict the response for given levels of A and B in their original units.")
+    with tab_coded:
+        st.code(result["eq_coded"], language=None)
+        st.caption(
+            "Coded factors range from −1 (low level) to +1 (high level) over the "
+            "explored design space, so coefficient magnitude directly reflects "
+            "each term's relative effect on the response."
+        )
+
+    st.markdown("#### Export")
+    docx_buf = build_anova_docx(response_name, result)
+    st.download_button(
+        f"Download ANOVA table (Word) — {response_name}",
+        data=docx_buf,
+        file_name=f"ANOVA_{response_name.replace(' ', '_')}.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+    st.caption(
+        "The exported table matches this page (Source / SS / df / MS / F-value / "
+        "p-value / Significance), followed by fit statistics and both final "
+        "equations — formatted to drop directly into a manuscript's Results "
+        "and Discussion section."
+    )
 
 # ---------------- Response surfaces ----------------
 elif page == "Response Surfaces":
@@ -551,8 +882,7 @@ elif page == "Response Surfaces":
             height=560, margin=dict(l=0, r=0, t=20, b=0),
             paper_bgcolor="rgba(0,0,0,0)", font=dict(family="Inter, sans-serif", color="#101820"),
         )
-        st.plotly_chart(fig3d, width='stretch', config=plot_config(f"3d_surface_{target_name.replace(' ', '_').lower()}"))
-        st.caption("📷 Hover the chart and use the camera icon in the toolbar to download it as a PNG.")
+        st.plotly_chart(fig3d, width='stretch')
 
     with tab_contour:
         figc = go.Figure(data=go.Contour(
@@ -570,8 +900,7 @@ elif page == "Response Surfaces":
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
             font=dict(family="Inter, sans-serif", color="#101820"),
         )
-        st.plotly_chart(figc, width='stretch', config=plot_config(f"contour_{target_name.replace(' ', '_').lower()}"))
-        st.caption("📷 Hover the chart and use the camera icon in the toolbar to download it as a PNG.")
+        st.plotly_chart(figc, width='stretch')
 
 # ---------------- Optimization ----------------
 elif page == "Optimization":
@@ -610,8 +939,7 @@ elif page == "Outlier Analysis":
     fig.update_layout(showlegend=False, height=380, margin=dict(l=10, r=10, t=40, b=10),
                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                        font=dict(family="Inter, sans-serif", color="#101820"))
-    st.plotly_chart(fig, width='stretch', config=plot_config("independent_variables_boxplots"))
-    st.caption("📷 Hover the chart and use the camera icon in the toolbar to download it as a PNG.")
+    st.plotly_chart(fig, width='stretch')
 
     st.markdown("#### Dependent Variables")
     dep_cols = ["Entrapment efficiency", "Drug content", "Drug release", "Particle size"]
@@ -621,8 +949,7 @@ elif page == "Outlier Analysis":
     fig2.update_layout(showlegend=False, height=380, margin=dict(l=10, r=10, t=40, b=10),
                         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                         font=dict(family="Inter, sans-serif", color="#101820"))
-    st.plotly_chart(fig2, width='stretch', config=plot_config("dependent_variables_boxplots"))
-    st.caption("📷 Hover the chart and use the camera icon in the toolbar to download it as a PNG.")
+    st.plotly_chart(fig2, width='stretch')
 
     st.markdown("#### Z-Score Outlier Detection")
     numeric_data = data.select_dtypes(include=[np.number])
@@ -641,8 +968,7 @@ elif page == "Outlier Analysis":
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family="Inter, sans-serif", color="#101820"),
     )
-    st.plotly_chart(fig3, width='stretch', config=plot_config("zscore_outlier_detection"))
-    st.caption("📷 Hover the chart and use the camera icon in the toolbar to download it as a PNG.")
+    st.plotly_chart(fig3, width='stretch')
 
     st.markdown("#### Outlier Runs (All Variables)")
     st.write(data[outliers])
