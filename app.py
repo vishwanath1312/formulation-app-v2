@@ -621,8 +621,9 @@ elif page == "Reverse Prediction":
     if st.button("Find Matching Formulation"):
         targets = np.array([target_ee, target_dc, target_dr, target_ps])
         weights = np.array([weight_ee, weight_dc, weight_dr, weight_ps])
-        y_ranges = (y.max() - y.min()).to_numpy()
-        y_ranges[y_ranges == 0] = 1.0  # avoid div-by-zero
+        y_ranges = np.asarray(y.max(axis=0) - y.min(axis=0), dtype=float)
+        # Avoid division by zero for responses that are constant in a new dataset.
+        y_ranges = np.where(np.isfinite(y_ranges) & (y_ranges > 0), y_ranges, 1.0)
 
         def forward_predict(x1, x2):
             return models[forward_model_name].predict([[x1, x2]])[0]
