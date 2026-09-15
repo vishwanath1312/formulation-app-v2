@@ -154,19 +154,54 @@ def render_header(eyebrow, title, subtitle=None, facts=None):
 os.makedirs("models", exist_ok=True)
 
 DATA_PATH = os.path.join("data", "data of the formulation.xlsx")
+INPUT_COLS = ["Stearic acid", "Tween 80"]
+OUTPUT_COLS = ["Entrapment efficiency", "Drug content", "Drug release", "Particle size"]
+REQUIRED_COLS = INPUT_COLS + OUTPUT_COLS
 
-
-# ----------------------------------------------------------------------
-# Load dataset
-# ----------------------------------------------------------------------
 @st.cache_data
-def load_data():
+def load_excel_or_csv(file_bytes, filename):
+    bio = BytesIO(file_bytes)
+    return pd.read_csv(bio) if filename.lower().endswith(".csv") else pd.read_excel(bio)
+
+def validate_and_clean_dataset(df):
+    df = df.copy()
+    missing = [c for c in REQUIRED_COLS if c not in df.columns]
+    if missing:
+        raise ValueError("Missing required columns: " + ", ".join(missing))
+    for col in REQUIRED_COLS:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    before = len(df)
+    df = df.dropna(subset=REQUIRED_COLS).reset_index(drop=True)
+    if "Runs" not in df.columns:
+        df.insert(0, "Runs", np.arange(1, len(df) + 1))
+    return df, before - len(df)
+
+@st.cache_data
+def load_default_data():
     return pd.read_excel(DATA_PATH)
 
+st.sidebar.markdown("### Dataset source")
+uploaded_file = st.sidebar.file_uploader("Upload new Excel/CSV dataset", type=["xlsx", "xls", "csv"])
+if uploaded_file is not None:
+    try:
+        data, dropped_rows = validate_and_clean_dataset(load_excel_or_csv(uploaded_file.getvalue(), uploaded_file.name))
+        st.sidebar.success(f"Using uploaded dataset: {len(data)} valid runs")
+        if dropped_rows:
+            st.sidebar.warning(f"Removed {dropped_rows} incomplete row(s).")
+    except Exception as exc:
+        st.sidebar.error(f"Dataset error: {exc}")
+        st.stop()
+else:
+    data, dropped_rows = validate_and_clean_dataset(load_default_data())
 
-data = load_data()
-X = data[["Stearic acid", "Tween 80"]]
-y = data[["Entrapment efficiency", "Drug content", "Drug release", "Particle size"]]
+X = data[INPUT_COLS]
+y = data[OUTPUT_COLS]
+if len(data) < 3:
+    st.error("At least 3 complete experimental runs are required for model training.")
+    st.stop()
+with st.sidebar.expander("Required columns"):
+    st.code("\n".join(REQUIRED_COLS))
+
 
 
 # ----------------------------------------------------------------------
@@ -379,8 +414,7 @@ def build_anova_docx(response, result):
 # Every model is a Pipeline (StandardScaler + estimator) so all six models
 # share one calling convention: models[name].predict([[x1, x2]]).
 # Hyperparameters are tuned via leave-one-out cross-validation (LOOCV) —
-# with only 10 experimental runs, a single train/test split is far too
-# noisy to trust, so every fold gets to act as the test set exactly once.
+# for small experimental datasets, a single random train/test split can be unstable, so every fold gets to act as the test set exactly once.
 def build_model_specs():
     return {
         "Linear Regression": (
@@ -434,7 +468,7 @@ def train_models(X, y):
 
     for name, (pipe, grid) in model_specs.items():
         if grid:
-            search = GridSearchCV(pipe, grid, cv=loo, scoring="r2", n_jobs=1)
+            search = GridSearchCV(pipe, grid, cv=loo, scoring="neg_mean_absolute_error", n_jobs=1, error_score="raise")
             search.fit(X, y)
             best_est = search.best_estimator_
             best_params[name] = search.best_params_
@@ -444,7 +478,7 @@ def train_models(X, y):
 
         # Out-of-fold (leave-one-out) predictions using the tuned hyperparameters
         # give an honest estimate of how the model performs on unseen runs,
-        # using every one of the 10 experimental points as a held-out test case.
+        # using every experimental point as a held-out test case.
         oof_pred = cross_val_predict(best_est, X, y, cv=loo, n_jobs=1)
         metrics[name] = {
             "R² (LOOCV)": r2_score(y, oof_pred),
@@ -496,7 +530,7 @@ if page == "Dataset":
     render_header(
         "Raw Data",
         "Original Dataset",
-        "The experimental design matrix used to train and validate every model in this app.",
+        "The dataset currently selected for training and validation. Upload a new Excel/CSV file in the sidebar to retrain automatically.",
         facts=[f"<b>{data.shape[0]}</b> runs", f"<b>{data.shape[1]}</b> columns",
                "<b>2</b> factors", "<b>4</b> responses"],
     )
@@ -520,8 +554,8 @@ elif page == "Prediction":
         "Enter a candidate formulation and compare predictions across all six tuned models.",
     )
     st.sidebar.header("Input Parameters")
-    stearic = st.sidebar.number_input("Stearic acid", min_value=60, max_value=400, step=10, value=240)
-    tween = st.sidebar.number_input("Tween 80", min_value=60, max_value=200, step=10, value=120)
+    stearic = st.sidebar.number_input("Stearic acid", min_value=float(X["Stearic acid"].min()), max_value=float(X["Stearic acid"].max()), value=float(X["Stearic acid"].mean()))
+    tween = st.sidebar.number_input("Tween 80", min_value=float(X["Tween 80"].min()), max_value=float(X["Tween 80"].max()), value=float(X["Tween 80"].mean()))
 
     if st.sidebar.button("Predict"):
         output_cols = ["Entrapment efficiency", "Drug content", "Drug release", "Particle size"]
@@ -650,10 +684,9 @@ elif page == "Model Comparison":
         "Leave-one-out cross-validated performance across all six tuned models.",
     )
     st.markdown(
-        "Each of the 10 experimental runs is held out and predicted "
-        "exactly once by a model trained on the other 9. This is far more "
-        "reliable than a single random train/test split on a 10-row dataset, "
-        "where the test set would only be 1–2 points."
+        f"Each of the {len(data)} experimental runs is held out and predicted "
+        f"exactly once by a model trained on the other {len(data)-1}. LOOCV "
+        "adapts automatically to the selected dataset size."
     )
 
     metrics_df = pd.DataFrame(metrics).T
@@ -692,11 +725,8 @@ elif page == "Model Comparison":
             st.write(f"**{name}:** (no tunable hyperparameters)")
 
     st.caption(
-        "Even with tuning, a 10-run dataset limits how accurate any model can "
-        "be — the regularized Polynomial (RSM) model tends to generalize best "
-        "here because it matches the underlying 2-factor design-of-experiments "
-        "structure, while more flexible models (Random Forest, SVR, XGBoost, "
-        "Decision Tree) have too little data to reliably learn complex patterns."
+        f"The current dataset contains {len(data)} complete runs. Metrics are "
+        "directional and should be confirmed with experimental validation, especially for small datasets."
     )
 
 # ---------------- ANOVA ----------------
@@ -709,6 +739,9 @@ elif page == "ANOVA Analysis":
         "lack-of-fit test, fit statistics, and the final regression equation.",
     )
     response_name = st.selectbox("Response", y.columns.tolist())
+    if len(data) < 7:
+        st.warning("Quadratic RSM ANOVA requires at least 7 complete runs. Add more experimental runs to enable this analysis.")
+        st.stop()
     result = compute_rsm_anova(data, response_name)
     anova_df = result["anova_df"]
     fs = result["fit_stats"]
@@ -953,7 +986,7 @@ elif page == "Outlier Analysis":
 
     st.markdown("#### Z-Score Outlier Detection")
     numeric_data = data.select_dtypes(include=[np.number])
-    z_scores = np.abs(zscore(numeric_data))
+    z_scores = np.abs(zscore(numeric_data, nan_policy="omit"))
     outliers = (z_scores > 2).any(axis=1)
 
     fig3 = go.Figure()

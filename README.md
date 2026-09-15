@@ -155,3 +155,19 @@ Opens at `http://localhost:8501`.
 - Training + hyperparameter tuning (cached via `st.cache_resource`) runs
   once per session — expect a short delay (well under a minute) the first
   time the app loads or after `app.py`/the data file changes.
+
+## Use a new experimental dataset
+
+The dashboard is not locked to the original 10-run dataset. Use the **Dataset source → Upload new Excel/CSV dataset** control in the sidebar. The app validates the required columns, removes incomplete required rows, retrains all six models, recalculates LOOCV metrics, selects the best model, and updates prediction, inverse design, response surfaces, optimization, and outlier analysis for the uploaded data.
+
+Required columns:
+- `Stearic acid`
+- `Tween 80`
+- `Entrapment efficiency`
+- `Drug content`
+- `Drug release`
+- `Particle size`
+
+A `Runs` column is optional; it is generated automatically when absent. Extra columns are allowed and remain visible on the Dataset page.
+
+For hyperparameter tuning, MAE is used as the GridSearchCV selection score because a one-observation LOOCV test fold does not provide a meaningful R² score. Final R²/MAE/MSE/RMSE are then calculated from the complete LOOCV predictions.
